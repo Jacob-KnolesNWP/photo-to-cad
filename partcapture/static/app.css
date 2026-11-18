@@ -148,4 +148,26 @@ ol.steps li { margin: 8px 0; }
 
 .hidden { display: none !important; }
 .fine { color: var(--muted); font-size: 14px; }
+
+.sheet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+@media (min-width: 800px) {
+  .sheet-grid { grid-template-columns: 1fr 1fr 1fr; }
+  main { max-width: 980px; }
+}
+a.sheet {
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  min-height: 64px; padding: 12px; border-radius: 14px; text-decoration: none;
+  background: var(--accent); color: var(--accent-ink); font-weight: 700; line-height: 1.25;
+}
+a.sheet.alt { background: #24372c; }
+.drop {
+  border: 2px dashed #c4b39a; border-radius: 16px; background: #fff;
+  padding: 18px; text-align: center;
+}
+.drop.hot { border-color: var(--accent); background: #fff4ee; }
+.result { display: grid; grid-template-columns: 96px 1fr; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.result img { width: 96px; height: 96px; object-fit: cover; border-radius: 10px; background: #eee; }
+details.tips { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 8px 14px; }
+details.tips summary { cursor: pointer; font-weight: 700; min-height: 44px; display: flex; align-items: center; }
+details.tips li { margin: 6px 0; }
 canvas.viewer { width: 100%; height: 320px; background: #d9d0c3; border-radius: 12px; touch-action: none; }

@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import threading
+import zipfile
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pillow_heif = None
 
 from partcapture.config import FLAT_MAX_EDGE, JOBS_DIR, OBJECT_MAX_EDGE, ensure_dirs
 from partcapture.db import get_db
@@ -18,6 +27,7 @@ from partcapture.pipeline.errors import CaptureError
 from partcapture.pipeline.geometry import outline_from_json
 from partcapture.pipeline.mesh_export import write_obj, write_stl
 from partcapture.pipeline.photogrammetry import reconstruct_object, scale_mesh_to_distance, scale_mesh_to_extents
+from partcapture.pipeline.photo_measure import measure_photo
 from partcapture.pipeline.twod import measure_flat_images
 
 _worker: "Worker | None" = None
@@ -28,12 +38,60 @@ def job_dir(job_id: str) -> Path:
     return JOBS_DIR / job_id
 
 
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
+
+
+def focal_35mm_from_bytes(data: bytes) -> float | None:
+    """35 mm-equivalent focal length from EXIF, before the pixels are re-saved."""
+    try:
+        image = Image.open(io.BytesIO(data))
+        exif = image.getexif()
+        sub = exif.get_ifd(0x8769)
+        value = sub.get(0xA405)
+        if value:
+            return float(value)
+    except Exception:
+        return None
+    return None
+
+
 def decode_image(data: bytes) -> np.ndarray:
-    image = Image.open(__import__("io").BytesIO(data))
+    image, _focal = decode_image_with_focal(data)
+    return image
+
+
+def decode_image_with_focal(data: bytes) -> tuple[np.ndarray, float | None]:
+    focal = focal_35mm_from_bytes(data)
+    image = Image.open(io.BytesIO(data))
     image = ImageOps.exif_transpose(image)
     image = image.convert("RGB")
     array = np.array(image)
-    return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+    if array.ndim == 2:
+        array = cv2.cvtColor(array, cv2.COLOR_GRAY2RGB)
+    return cv2.cvtColor(array, cv2.COLOR_RGB2BGR), focal
+
+
+def images_from_zip(data: bytes) -> list[tuple[str, bytes]]:
+    """Pull photos out of a zip. Skip folders, Apple junk, and non-images."""
+    found = []
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("That zip file could not be opened.") from exc
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        name = Path(info.filename).name
+        if not name or name.startswith(".") or name.startswith("__MACOSX") or info.filename.startswith("__MACOSX"):
+            continue
+        if Path(name).suffix.lower() not in _IMAGE_SUFFIXES:
+            continue
+        if info.file_size > 40 * 1024 * 1024:
+            continue
+        found.append((name, archive.read(info)))
+        if len(found) >= 40:
+            break
+    return found
 
 
 def downscale(image: np.ndarray, max_edge: int) -> np.ndarray:
@@ -187,6 +245,70 @@ def export_dxf(job_id: str, unit: str) -> Path:
     return target
 
 
+def save_batch_inputs(job_id: str, items: list[tuple[str, np.ndarray, float | None]]) -> None:
+    folder = job_dir(job_id) / "inputs"
+    folder.mkdir(parents=True, exist_ok=True)
+    meta = []
+    for index, (name, image, focal) in enumerate(items):
+        filename = f"{index:03d}.jpg"
+        cv2.imwrite(str(folder / filename), image, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        meta.append({"file": filename, "name": name, "focal_35mm": focal})
+    (folder / "batch.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+def process_batch(job_id: str) -> None:
+    db = get_db()
+    folder = job_dir(job_id)
+    meta = json.loads((folder / "inputs" / "batch.json").read_text(encoding="utf-8"))
+    options = json.loads((folder / "options.json").read_text(encoding="utf-8"))
+    items_dir = folder / "items"
+    items_dir.mkdir(exist_ok=True)
+    photos = []
+    dxf_paths = []
+    for index, item in enumerate(meta):
+        db.update(job_id, progress=(index + 0.2) / max(len(meta), 1), message=f"Measuring {item['name']}")
+        image = cv2.imread(str(folder / "inputs" / item["file"]), cv2.IMREAD_COLOR)
+        result = measure_photo(
+            image,
+            thickness_mm=options.get("thickness_mm"),
+            profile=options.get("profile") or "prism",
+            caliper_mm=options.get("caliper_mm"),
+            units=options.get("units") or "mm",
+            bg=options.get("bg") or "auto",
+            focal_35mm=item.get("focal_35mm"),
+        )
+        entry = result.to_json()
+        entry["name"] = item["name"]
+        entry["index"] = index
+        if result.overlay_bgr is not None:
+            cv2.imwrite(str(items_dir / f"{index:03d}.jpg"), result.overlay_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            entry["overlay"] = True
+        if result.dxf_bytes:
+            dxf_path = items_dir / f"{index:03d}.dxf"
+            dxf_path.write_bytes(result.dxf_bytes)
+            dxf_paths.append((item["name"], dxf_path))
+            entry["dxf"] = True
+        photos.append(entry)
+    if dxf_paths:
+        used = set()
+        with zipfile.ZipFile(folder / "batch.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+            for index, (name, path) in enumerate(dxf_paths):
+                stem = Path(name).stem or "part"
+                filename = f"{stem}.dxf"
+                if filename in used:
+                    filename = f"{index:02d}-{stem}.dxf"
+                used.add(filename)
+                archive.write(path, filename)
+    ok = sum(1 for photo in photos if photo["ok"])
+    db.update(
+        job_id,
+        status="done",
+        progress=1.0,
+        message=f"{ok} of {len(photos)} photos measured",
+        result_json=json.dumps({"photos": photos, "options": options}),
+    )
+
+
 def run_job(job_id: str) -> None:
     db = get_db()
     record = db.get(job_id)
@@ -197,6 +319,8 @@ def run_job(job_id: str) -> None:
             process_flat(job_id)
         elif record["mode"] == "object":
             process_object(job_id)
+        elif record["mode"] == "batch":
+            process_batch(job_id)
         else:
             raise CaptureError("BAD_JOB", "Unknown job type.")
     except CaptureError as exc:
