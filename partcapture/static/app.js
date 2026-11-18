@@ -22,7 +22,7 @@ back.onclick = () => {
 function go(screen) {
   state.screen = screen;
   back.hidden = screen === "home";
-  const screens = { home, print: printScreen, flat: flatScreen, review: reviewScreen, object: objectScreen, model: modelScreen, history: historyScreen };
+  const screens = { home, print: printScreen, flat: flatScreen, review: reviewScreen, object: objectScreen, model: modelScreen, history: historyScreen, batch: batchScreen };
   (screens[screen] || home)();
 }
 
@@ -41,26 +41,194 @@ async function api(url, options) {
 function home() {
   show(el(`
     <section>
-      <h1>Photo to CAD</h1>
-      <p class="lead">Turn a phone photo of a real part into geometry SOLIDWORKS can open, at true size.</p>
-      <button class="choice" id="go-flat" type="button">
-        <strong>Flat part</strong>
-        <span>Plates, brackets, gaskets, templates. One or more photos on marker sheets. Exports a 1:1 DXF.</span>
-        <span class="tag">Target: under 1 mm on a single sheet</span>
-      </button>
-      <button class="choice" id="go-object" type="button">
-        <strong>3D part</strong>
-        <span>Walk around the piece with markers in view. Exports STL and OBJ. Check critical sizes with calipers — phone 3D is about ±1.5 mm on a small part, and the error grows with size.</span>
-        <span class="tag">STL + OBJ</span>
-      </button>
-      <button class="secondary" id="go-print" type="button">Print marker sheets</button>
-      <button class="ghost" id="go-history" type="button" style="margin-top:8px">Past jobs</button>
+      <h1>Measure a flat part</h1>
+      <p class="lead">Print a marker sheet, photograph the part on it, get a 1:1 DXF.</p>
+      <div class="banner warn">Print at 100% (not Fit to page) and check the black bar with a ruler before you shoot.</div>
+      <div class="sheet-grid">
+        <a class="sheet" href="/api/sheets/pdf?layout=letter&count=4&start=1">Letter sheets 1–4</a>
+        <a class="sheet alt" href="/api/sheets/pdf?layout=letter&count=1&start=1">Letter 1</a>
+        <a class="sheet alt" href="/api/sheets/pdf?layout=letter&count=1&start=2">Letter 2</a>
+        <a class="sheet alt" href="/api/sheets/pdf?layout=letter&count=1&start=3">Letter 3</a>
+        <a class="sheet alt" href="/api/sheets/pdf?layout=letter&count=1&start=4">Letter 4</a>
+        <a class="sheet" href="/api/sheets/pdf?layout=tabloid&count=1&start=1">Tabloid 11×17</a>
+        <a class="sheet" href="/api/sheets/pdf?layout=large&count=1&start=1">Large board 24×36</a>
+      </div>
+
+      <form class="card" id="batch">
+        <h2>Photos</h2>
+        <div class="drop" id="drop">
+          <strong>Drop photos or a zip here</strong>
+          <p class="fine">Several pictures at once, or a .zip of them. iPhone HEIC is fine.</p>
+          <label class="secondary" style="display:inline-block;padding:12px 16px;border-radius:12px;border:1px solid var(--line)">
+            Choose files
+            <input id="files" type="file" accept="image/*,.heic,.heif,.zip,application/zip" multiple hidden>
+          </label>
+        </div>
+        <div class="camera" id="camera" hidden><video id="video" playsinline autoplay muted></video></div>
+        <div class="row" style="margin-top:8px">
+          <button class="secondary" id="open-cam" type="button">Use camera</button>
+          <button class="secondary" id="shutter" type="button" disabled>Take photo</button>
+        </div>
+        <p class="fine" id="count">No photos yet.</p>
+        <div class="thumbs" id="thumbs"></div>
+        <label class="field">Part thickness (mm)
+          <span>How far the top edge sits above the sheet. A close photo magnifies a thick part.</span>
+          <input name="thickness" type="number" min="0" step="0.1" inputmode="decimal" placeholder="e.g. 14">
+        </label>
+        <label class="field">Edge
+          <select name="profile">
+            <option value="prism" selected>Square / prism (plates, blocks)</option>
+            <option value="rounded">Rounded (widest at mid-height)</option>
+          </select>
+        </label>
+        <label class="field">Units
+          <select name="units" id="units">
+            <option value="mm" selected>Millimetres</option>
+            <option value="in">Inches</option>
+          </select>
+        </label>
+        <label class="field">Caliper reading <span id="cal-unit">(optional, longest side, mm)</span>
+          <input name="caliper" type="number" min="0" step="0.01" inputmode="decimal" placeholder="optional">
+        </label>
+        <button class="primary" id="run" type="submit">Measure photos</button>
+        <p id="err"></p>
+      </form>
+
+      <details class="tips">
+        <summary>Photo tips</summary>
+        <p><b>Before you shoot</b></p>
+        <ol>
+          <li>Print at 100% (“Actual size”), never “Fit to page”.</li>
+          <li>Check the black bar with a ruler (letter 100 mm, tabloid 200 mm, large 400 mm). If it is off, reprint.</li>
+          <li>Tape the sheet flat. No curl, wrinkles, or tape over markers.</li>
+          <li>A dark part on the white sheet is fine. For a light or shiny part, lay matte dark or coloured paper under it, inside the markers, 10 mm clear of every marker.</li>
+          <li>Keep the whole part inside the frame, about 5 mm clear of every marker, lying flat.</li>
+        </ol>
+        <p><b>Shooting</b></p>
+        <ol start="6">
+          <li>Straight down from 16–20 in (400–500 mm), 2x lens. Not 0.5x ultra-wide, no digital zoom. Closer than about 12 in magnifies raised edges.</li>
+          <li>All markers visible. The sheet should fill most of the frame.</li>
+          <li>Soft even light. No flash, no hard shadow, no glare.</li>
+          <li>Hold still, tap to focus, take two or three shots.</li>
+        </ol>
+        <p><b>Numbers and large parts</b></p>
+        <ol start="10">
+          <li>Enter the thickness. Square edges use the prism correction; rounded edges assume the widest point is halfway up.</li>
+          <li>One caliper reading of the longest side locks the scale.</li>
+          <li>For a big part, lay numbered sheets around it in one photo. Sheet numbers are read from the markers.</li>
+          <li>On the result, red is the raw silhouette and green is the corrected outline. If it hugs a shadow, the backing, or a marker, retake.</li>
+        </ol>
+      </details>
+      <p style="margin-top:16px">
+        <button class="ghost" id="go-object" type="button">3D walk-around (STL)</button>
+        <button class="ghost" id="go-history" type="button">Past jobs</button>
+      </p>
     </section>
   `));
-  document.querySelector("#go-flat").onclick = () => { state.photos = []; go("flat"); };
-  document.querySelector("#go-object").onclick = () => { state.photos = []; go("object"); };
-  document.querySelector("#go-print").onclick = () => go("print");
-  document.querySelector("#go-history").onclick = () => go("history");
+  wireHome();
+}
+
+function wireHome() {
+  const form = document.querySelector("#batch");
+  const drop = document.querySelector("#drop");
+  const err = document.querySelector("#err");
+  const units = document.querySelector("#units");
+  units.onchange = () => {
+    document.querySelector("#cal-unit").textContent = units.value === "in"
+      ? "(optional, longest side, inches)"
+      : "(optional, longest side, mm)";
+  };
+  const addFiles = (fileList) => {
+    for (const file of fileList) state.photos.push(file);
+    renderThumbs();
+    document.querySelector("#count").textContent = `${state.photos.length} file${state.photos.length === 1 ? "" : "s"} ready`;
+  };
+  document.querySelector("#files").onchange = (event) => addFiles(event.target.files);
+  drop.ondragover = (event) => { event.preventDefault(); drop.classList.add("hot"); };
+  drop.ondragleave = () => drop.classList.remove("hot");
+  drop.ondrop = (event) => {
+    event.preventDefault();
+    drop.classList.remove("hot");
+    addFiles(event.dataTransfer.files);
+  };
+  document.querySelector("#open-cam").onclick = async () => {
+    try { await openCamera(); }
+    catch (e) { err.innerHTML = `<div class="banner bad">Camera blocked. Choose files instead. ${e.message}</div>`; }
+  };
+  document.querySelector("#shutter").onclick = () => {
+    const video = document.querySelector("#video");
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+    canvas.toBlob((blob) => {
+      state.photos.push(new File([blob], `camera-${state.photos.length + 1}.jpg`, { type: "image/jpeg" }));
+      renderThumbs();
+      document.querySelector("#count").textContent = `${state.photos.length} file${state.photos.length === 1 ? "" : "s"} ready`;
+    }, "image/jpeg", 0.92);
+  };
+  document.querySelector("#go-object").onclick = () => { stopCamera(); state.photos = []; go("object"); };
+  document.querySelector("#go-history").onclick = () => { stopCamera(); go("history"); };
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    if (!state.photos.length) {
+      err.innerHTML = `<div class="banner bad">Add at least one photo or zip.</div>`;
+      return;
+    }
+    const body = new FormData();
+    state.photos.forEach((file) => body.append("files", file, file.name || "photo.jpg"));
+    const thickness = form.thickness.value;
+    const caliper = form.caliper.value;
+    if (thickness) body.append("thickness_mm", thickness);
+    body.append("profile", form.profile.value);
+    body.append("units", form.units.value);
+    if (caliper) {
+      const value = Number(caliper) * (form.units.value === "in" ? 25.4 : 1);
+      body.append("caliper_mm", String(value));
+    }
+    err.innerHTML = `<div class="banner info">Measuring…</div>`;
+    try {
+      stopCamera();
+      const job = await api("/api/jobs/batch", { method: "POST", body });
+      state.photos = [];
+      await watch(job.id, "batch");
+    } catch (e) {
+      err.innerHTML = `<div class="banner bad">${e.message}</div>`;
+    }
+  };
+  renderThumbs();
+}
+
+function batchScreen() {
+  const job = state.job;
+  const photos = (job.result && job.result.photos) || [];
+  const cards = photos.map((photo) => {
+    if (!photo.ok) {
+      return `<div class="result"><div></div><div><strong>${photo.name}</strong><div class="banner bad">${photo.error || "Failed"}</div></div></div>`;
+    }
+    const holes = (photo.holes || []).filter((h) => h.shape === "circle").map((h) => ` · hole ${h.diameter_mm.toFixed(2)} mm`).join("");
+    const warns = (photo.warnings || []).map((w) => `<div class="fine">${w}</div>`).join("");
+    const thumb = photo.overlay
+      ? `<img alt="" src="/api/jobs/${job.id}/items/${photo.index}/overlay.jpg">`
+      : "<div></div>";
+    return `<div class="result">${thumb}<div>
+      <strong>${photo.name}</strong>
+      <div>${photo.length_mm.toFixed(2)} × ${photo.width_mm.toFixed(2)} mm${holes}</div>
+      <div class="fine">Camera ${photo.camera_height_mm ?? "?"} mm up · ±${photo.estimated_error_mm} mm</div>
+      ${warns}
+      <p><a href="/api/jobs/${job.id}/items/${photo.index}/part.dxf">Download DXF</a></p>
+    </div></div>`;
+  }).join("");
+  show(el(`
+    <section>
+      <h1>Results</h1>
+      <p class="lead">${job.message || ""}</p>
+      ${photos.some((photo) => photo.dxf) ? `<a class="sheet" href="/api/jobs/${job.id}/batch.zip">Download all DXFs as zip</a>` : ""}
+      <div class="card">${cards || "<p>No photos.</p>"}</div>
+      <button class="secondary" id="again" type="button">Measure more</button>
+    </section>
+  `));
+  document.querySelector("#again").onclick = () => { state.photos = []; go("home"); };
 }
 
 async function printScreen() {
@@ -126,7 +294,14 @@ function renderThumbs() {
     del.onclick = () => {
       state.photos.splice(index, 1);
       if (state.screen === "object") objectScreen();
-      else flatScreen();
+      else if (state.screen === "flat") flatScreen();
+      else {
+        renderThumbs();
+        const count = document.querySelector("#count");
+        if (count) count.textContent = state.photos.length
+          ? `${state.photos.length} file${state.photos.length === 1 ? "" : "s"} ready`
+          : "No photos yet.";
+      }
     };
     fig.append(img, del);
     box.append(fig);
@@ -500,7 +675,11 @@ async function historyScreen() {
     const actions = row.querySelector(".row");
     if (job.status === "done") {
       const open = el(`<button class="secondary" type="button">Open</button>`);
-      open.onclick = async () => { state.job = await api("/api/jobs/" + job.id); go(job.mode === "flat" ? "review" : "model"); };
+      open.onclick = async () => {
+        state.job = await api("/api/jobs/" + job.id);
+        const next = job.mode === "flat" ? "review" : job.mode === "batch" ? "batch" : "model";
+        go(next);
+      };
       actions.append(open);
     }
     const del = el(`<button class="ghost" type="button">Delete</button>`);

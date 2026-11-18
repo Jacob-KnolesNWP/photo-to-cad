@@ -26,13 +26,16 @@ from partcapture.config import (
 from partcapture.db import get_db
 from partcapture.jobs import (
     decode_image,
+    decode_image_with_focal,
     delete_job,
     downscale,
     export_dxf,
     get_worker,
+    images_from_zip,
     job_dir,
     process_flat,
     rescale_object,
+    save_batch_inputs,
     save_inputs,
 )
 from partcapture.pipeline.errors import CaptureError
@@ -127,6 +130,85 @@ async def create_object_job(files: list[UploadFile] = File(...)):
         )
     images = await _read_uploads(files, OBJECT_MAX_EDGE, MAX_OBJECT_PHOTOS)
     return _enqueue("object", images)
+
+
+@app.post("/api/jobs/batch")
+async def create_batch_job(
+    files: list[UploadFile] = File(...),
+    thickness_mm: float | None = Form(None),
+    profile: str = Form("prism"),
+    caliper_mm: float | None = Form(None),
+    units: str = Form("mm"),
+    bg: str = Form("auto"),
+):
+    """One job, one part setup, many photos (loose files and/or zips)."""
+    if profile not in {"prism", "rounded"}:
+        raise HTTPException(status_code=400, detail="Edge profile must be prism (square) or rounded.")
+    if units not in {"mm", "in"}:
+        raise HTTPException(status_code=400, detail="Units must be mm or in.")
+    collected: list[tuple[str, np.ndarray, float | None]] = []
+    for upload in files:
+        data = await upload.read()
+        if not data:
+            continue
+        name = upload.filename or "photo"
+        blobs: list[tuple[str, bytes]] = []
+        if name.lower().endswith(".zip") or (upload.content_type or "").endswith("zip"):
+            try:
+                blobs = images_from_zip(data)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            blobs = [(name, data)]
+        for item_name, blob in blobs:
+            if len(blob) > MAX_UPLOAD_BYTES:
+                continue
+            try:
+                image, focal = decode_image_with_focal(blob)
+            except Exception:
+                continue
+            collected.append((item_name, downscale(image, FLAT_MAX_EDGE), focal))
+            if len(collected) >= 40:
+                break
+        if len(collected) >= 40:
+            break
+    if not collected:
+        raise HTTPException(
+            status_code=400,
+            detail="No photos found. Add JPEG, PNG, or HEIC pictures, or a zip of them.",
+        )
+    job_id = uuid4().hex
+    save_batch_inputs(job_id, collected)
+    (job_dir(job_id) / "options.json").write_text(
+        json.dumps(
+            {
+                "thickness_mm": thickness_mm,
+                "profile": profile,
+                "caliper_mm": caliper_mm,
+                "units": units,
+                "bg": bg,
+            }
+        ),
+        encoding="utf-8",
+    )
+    get_db().create(job_id, "batch")
+    get_worker().kick()
+    return {"id": job_id, "mode": "batch", "status": "queued", "count": len(collected)}
+
+
+@app.get("/api/jobs/{job_id}/batch.zip")
+def batch_zip(job_id: str):
+    return _file(job_id, "batch.zip", "application/zip", f"trueshape-{job_id[:8]}.zip")
+
+
+@app.get("/api/jobs/{job_id}/items/{index}/overlay.jpg")
+def item_overlay(job_id: str, index: int):
+    return _file(job_id, f"items/{index:03d}.jpg", "image/jpeg")
+
+
+@app.get("/api/jobs/{job_id}/items/{index}/part.dxf")
+def item_dxf(job_id: str, index: int):
+    return _file(job_id, f"items/{index:03d}.dxf", "application/dxf", f"part-{index + 1}.dxf")
 
 
 @app.post("/api/demo/flat")
